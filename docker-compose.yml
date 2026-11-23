@@ -1,0 +1,70 @@
+# ============================================================================
+# pdm-pipeline -- local development stack
+# ============================================================================
+# Built up one tier at a time. Today: the MQTT broker only.
+#
+# Adding a service later (kafka, flink, timescaledb, minio) means following the
+# mosquitto pattern below:
+#   * pin an explicit image tag (never :latest)
+#   * attach it to the shared "pdm" network so services resolve each other by
+#     container name (e.g. kafka reaches the broker at mosquitto:1883)
+#   * give it a healthcheck, so downstream services can gate startup with
+#     `depends_on: { <service>: { condition: service_healthy } }`
+#   * keep bind-mounted state under ./<service>/ and gitignore it
+# ============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # Ingest tier: MQTT broker. Devices / the replayer publish sensor telemetry
+  # here; a Kafka bridge will subscribe to it in a later step.
+  # --------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2.0.23
+    container_name: pdm-mosquitto
+    restart: unless-stopped
+    # Run as the image's mosquitto user from the start. ./mosquitto/data and
+    # ./mosquitto/log are pre-owned by 1883:1883 on the host, and running
+    # non-root also skips the entrypoint's `chown -R /mosquitto`, which would
+    # otherwise log "Read-only file system" errors against the :ro config mount.
+    user: "1883:1883"
+    ports:
+      - "1883:1883"
+    volumes:
+      # Config is read-only to the broker -- it never needs to write it.
+      - ./mosquitto/config:/mosquitto/config:ro
+      # Persistence DB and log file, both written as uid 1883.
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    networks:
+      - pdm
+    healthcheck:
+      # Round-trips a real QoS 1 publish to a plain application topic (NOT a
+      # read-only $SYS/... topic, which the broker would reject). mosquitto_pub
+      # exits non-zero if the TCP connect, the CONNACK or the PUBACK fails, so
+      # a half-up broker is reported unhealthy rather than healthy.
+      test:
+        - CMD
+        - mosquitto_pub
+        - -h
+        - 127.0.0.1
+        - -p
+        - "1883"
+        - -t
+        - healthcheck/ping
+        - -m
+        - ping
+        - -q
+        - "1"
+        - -i
+        - pdm-healthcheck
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+networks:
+  # Shared by every tier of the pipeline. Named explicitly so the network is
+  # "pdm" rather than the compose-prefixed "pdm-pipeline_pdm".
+  pdm:
+    name: pdm
+    driver: bridge

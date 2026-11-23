@@ -1,0 +1,9 @@
+data/raw
+data/raw/
+*.zip
+.venv/
+__pycache__/
+*.pyc
+.env
+mosquitto/data/
+mosquitto/log/
