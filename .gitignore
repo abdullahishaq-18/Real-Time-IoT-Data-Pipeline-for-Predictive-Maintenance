@@ -7,3 +7,4 @@ __pycache__/
 .env
 mosquitto/data/
 mosquitto/log/
+.pytest_cache/
