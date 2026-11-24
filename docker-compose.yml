@@ -1,14 +1,20 @@
 # ============================================================================
 # pdm-pipeline -- local development stack
 # ============================================================================
-# Built up one tier at a time. Today: the MQTT broker only.
+# Built up one tier at a time. Today: MQTT broker -> bridge -> Kafka (+ UI).
 #
-# Adding a service later (kafka, flink, timescaledb, minio) means following the
+#   replayer/devices --MQTT--> mosquitto --> mqtt-kafka-bridge --> kafka <-- kafka-ui
+#                                                                    ^
+#                                                 kafka-init (creates topics, exits 0)
+#
+# Memory: every container has a mem_limit (~2.2 GB total steady state).
+#
+# Adding a service later (flink, timescaledb, minio) means following the
 # mosquitto pattern below:
 #   * pin an explicit image tag (never :latest)
 #   * attach it to the shared "pdm" network so services resolve each other by
 #     container name (e.g. kafka reaches the broker at mosquitto:1883)
-#   * give it a healthcheck, so downstream services can gate startup with
+#   * give it a mem_limit and a healthcheck, so downstream services can gate startup with
 #     `depends_on: { <service>: { condition: service_healthy } }`
 #   * keep bind-mounted state under ./<service>/ and gitignore it
 # ============================================================================
@@ -16,12 +22,14 @@
 services:
   # --------------------------------------------------------------------------
   # Ingest tier: MQTT broker. Devices / the replayer publish sensor telemetry
-  # here; a Kafka bridge will subscribe to it in a later step.
+  # here; mqtt-kafka-bridge subscribes with a persistent session.
   # --------------------------------------------------------------------------
   mosquitto:
     image: eclipse-mosquitto:2.0.23
     container_name: pdm-mosquitto
     restart: unless-stopped
+    # Headroom for max_queued_messages (200000) if the bridge is down for long.
+    mem_limit: 384m
     # Run as the image's mosquitto user from the start. ./mosquitto/data and
     # ./mosquitto/log are pre-owned by 1883:1883 on the host, and running
     # non-root also skips the entrypoint's `chown -R /mosquitto`, which would
@@ -61,6 +69,148 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Streaming tier: single-node Kafka 4.x in KRaft mode (combined broker +
+  # controller, no ZooKeeper).
+  #   INTERNAL kafka:9092      -- containers on the "pdm" network
+  #   EXTERNAL localhost:9094  -- the host (.venv tools, scripts/kafka_check.py)
+  #   CONTROLLER :9093         -- KRaft quorum, not published
+  # NOTE: with any KAFKA_* env set, the image ignores its bundled
+  # server.properties and builds the config from env only, so every needed
+  # setting is listed here.
+  # --------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.4.0
+    container_name: pdm-kafka
+    hostname: kafka
+    restart: unless-stopped
+    mem_limit: 1g
+    ports:
+      - "9094:9094"
+    environment:
+      CLUSTER_ID: Mx7apcedSiGxqubHe4rJkw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single node: internal topics can only have one replica.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init; a typo'd topic name in a
+      # producer is an error, not a silently created 1-partition topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - pdm
+    healthcheck:
+      # A real Kafka API round trip. The CLI is a JVM, so give it a tiny heap
+      # (it would otherwise inherit the broker's 512m KAFKA_HEAP_OPTS and blow
+      # the 1g mem_limit).
+      test:
+        - CMD-SHELL
+        - >-
+          KAFKA_HEAP_OPTS='-Xms16m -Xmx64m' KAFKA_JVM_PERFORMANCE_OPTS='-XX:+UseSerialGC -XX:TieredStopAtLevel=1'
+          /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1
+      interval: 15s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+
+  # One-shot: create/verify topics, then exit 0. Services that need the topics
+  # use `depends_on: { kafka-init: { condition: service_completed_successfully } }`.
+  kafka-init:
+    image: apache/kafka:4.4.0
+    container_name: pdm-kafka-init
+    restart: "no"
+    mem_limit: 512m
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP: kafka:9092
+      KAFKA_HEAP_OPTS: -Xms32m -Xmx128m
+      KAFKA_JVM_PERFORMANCE_OPTS: -XX:+UseSerialGC -XX:TieredStopAtLevel=1
+    volumes:
+      - ./kafka/init-topics.sh:/init-topics.sh:ro
+    entrypoint: ["bash", "/init-topics.sh"]
+    networks:
+      - pdm
+
+  # --------------------------------------------------------------------------
+  # Kafka UI (kafbat, the maintained fork of provectus/kafka-ui).
+  # http://localhost:8080 -- read-only browsing of topics/messages; no auth,
+  # LOCAL DEV ONLY.
+  # --------------------------------------------------------------------------
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.5.1
+    container_name: pdm-kafka-ui
+    restart: unless-stopped
+    mem_limit: 512m
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: pdm
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_READONLY: "true"
+      DYNAMIC_CONFIG_ENABLED: "false"
+      JAVA_OPTS: -XX:MaxRAMPercentage=60 -XX:+UseSerialGC
+    networks:
+      - pdm
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health | grep -q UP"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # --------------------------------------------------------------------------
+  # MQTT -> Kafka bridge (./bridge). At-least-once: an MQTT message is acked
+  # only after Kafka confirmed it; while the bridge is down Mosquitto queues
+  # for its persistent session.
+  # --------------------------------------------------------------------------
+  mqtt-kafka-bridge:
+    build: ./bridge
+    image: pdm/mqtt-kafka-bridge:0.1.0
+    container_name: pdm-mqtt-kafka-bridge
+    restart: unless-stopped
+    mem_limit: 256m
+    # Shutdown flushes the producer (up to SHUTDOWN_TIMEOUT=30s) before exiting.
+    stop_grace_period: 40s
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: factory/engines/+/telemetry
+      MQTT_CLIENT_ID: pdm-mqtt-kafka-bridge
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC_RAW: sensor.telemetry.raw
+      KAFKA_TOPIC_DLQ: sensor.telemetry.dlq
+    networks:
+      - pdm
+    # Healthcheck (heartbeat file < 30s old) is defined in bridge/Dockerfile.
+
+volumes:
+  kafka-data:
+    name: pdm-kafka-data
 
 networks:
   # Shared by every tier of the pipeline. Named explicitly so the network is

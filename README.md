@@ -2,7 +2,8 @@
 
 Real-time IoT predictive-maintenance pipeline: MQTT -> Kafka -> Flink -> TimescaleDB/Iceberg -> ML.
 
-Currently implemented: the MQTT ingest broker and a C-MAPSS telemetry replayer.
+Currently implemented: the MQTT ingest broker, a C-MAPSS telemetry replayer, Kafka, and an
+MQTT -> Kafka bridge.
 
 ## Running the broker
 
@@ -162,7 +163,8 @@ scaled to the engine's last cycle in the file, it only reaches its peak on the
 .venv/bin/python -m pytest -v
 ```
 
-The tests exercise payload building and scheduling without a broker. Two tests
+The tests exercise payload building, scheduling, bridge validation, record building, ack
+ordering and the Kafka verifier's analysis, all without a broker. Two tests
 also run against `data/raw/train_FD001.txt` and are skipped if it's missing.
 
 For a live end-to-end check, `scripts/e2e_sub.py` subscribes to the telemetry
@@ -185,3 +187,160 @@ stops after `--idle` seconds (default 5) without a message.
 Run `.venv/bin/python scripts/e2e_sub.py --help` for all options, including
 `--out result.json` and `--ready-file`, which lets a script wait until the
 subscriber is ready before starting the replayer.
+
+## Kafka and the bridge
+
+### Architecture
+
+```
+replayer / devices                                               kafka-ui :8080
+      |  MQTT QoS 1                                                      |
+      v                                                                  v
+ mosquitto :1883 --(persistent session)--> mqtt-kafka-bridge --> kafka (KRaft) :9092 / :9094
+  queues up to 200k msgs                    ack only after       sensor.telemetry.raw (6 part.)
+  per offline client                        Kafka confirms       sensor.telemetry.dlq (1 part.)
+                                                                         ^
+                                                     kafka-init: creates topics, exits 0
+```
+
+| service | image | memory | notes |
+|---|---|---|---|
+| `mosquitto` | `eclipse-mosquitto:2.0.23` | 384m | `max_queued_messages 200000`, `persistent_client_expiration 1d` |
+| `kafka` | `apache/kafka:4.4.0` | 1g (heap 512m) | single node, combined broker + controller, no ZooKeeper, `auto.create.topics.enable=false` |
+| `kafka-init` | `apache/kafka:4.4.0` | 512m | one-shot `kafka/init-topics.sh`, idempotent; other services wait for it to exit 0 |
+| `kafka-ui` | `kafbat/kafka-ui:v1.5.1` | 512m | http://localhost:8080, read-only, no auth (local dev only) |
+| `mqtt-kafka-bridge` | built from `bridge/` (`python:3.12.16-slim`, non-root) | 256m | `bridge/bridge.py` |
+
+Kafka listeners: `kafka:9092` for containers on the `pdm` network, `localhost:9094` from
+the host. Kafka data lives in the named volume `pdm-kafka-data`. To start from an empty
+cluster, run `docker compose down -v`.
+
+```bash
+docker compose up -d --build     # whole stack; kafka-init runs once and exits 0
+scripts/verify-stack.sh          # config, health, verify-broker.sh, topics, Kafka UI
+scripts/verify-stack.sh --crash  # ... plus 3 bridge SIGKILL rounds (--crash=N for N), ~1 min each
+docker compose logs -f mqtt-kafka-bridge   # counters every 10 s
+```
+
+### Topics
+
+| topic | partitions | retention | key | value |
+|---|---|---|---|---|
+| `sensor.telemetry.raw` | 6 | 7 days, lz4 | `engine_id` | original MQTT payload bytes (schema above), unchanged |
+| `sensor.telemetry.dlq` | 1 | 30 days | `engine_id` from the topic (if parseable) | original MQTT payload bytes |
+
+Headers on raw records: `mqtt_topic`, `bridge_ingest_time` (ISO-8601 UTC, ms), `schema_version`.
+Headers on DLQ records: `error_reason`, `mqtt_topic`, `bridge_ingest_time`.
+
+The key is the `engine_id` and the bridge uses the Java-compatible `murmur2` partitioner,
+so all of an engine's records land in one partition, in order. Java/Flink producers map
+the same keys to the same partitions.
+
+The bridge sends a message to the DLQ when the payload is not JSON (`invalid_json`), is
+not an object (`not_an_object`), lacks contract keys (`missing_keys: ...`), has extra keys
+(`unexpected_keys: ...`), has `schema_version != 1` (`schema_version_mismatch`), or has an
+`engine_id` that doesn't match the topic (`engine_id_mismatch`). Deeper type checks are left
+to consumers. A bad message is logged, sent to the DLQ and acked. It never stops the bridge.
+
+### Delivery guarantees: at-least-once
+
+* The bridge subscribes at QoS 1 with a fixed client id and a persistent MQTT 5 session
+  (`clean_start=False`, session expiry 1 day). While the bridge is down, Mosquitto queues
+  its messages, up to `max_queued_messages`.
+* The producer is idempotent (`acks=all`, `enable.idempotence=true`), so its own retries
+  don't create duplicates or reorder records. Records never time out locally
+  (`message.timeout.ms=0`). During a Kafka outage they wait in the producer. The bridge
+  allows at most 1000 unacked MQTT messages in flight (MQTT receive maximum), and Mosquitto
+  queues the rest. That is backpressure, not loss.
+* paho runs in manual-ack mode. An MQTT message is acked **only from the Kafka delivery
+  report**, never earlier, and acks go out in the order the messages were received, as MQTT
+  requires.
+* On SIGTERM/SIGINT (`docker compose stop`, Ctrl+C) the bridge stops consuming, flushes the
+  producer, acks what was delivered and exits 0. Anything it did not finish is redelivered
+  in the next session.
+* **Duplicates are possible** after a crash or network drop, when Kafka has the record but
+  the PUBACK never reached Mosquitto. Consumers must deduplicate on `(engine_id, cycle)`,
+  which is unique per the payload contract. Loss is not possible, short of Mosquitto's queue
+  overflowing or the session expiring after a day offline.
+
+Measured with `scripts/kafka_check.py` on the hold-out replay (units 81-100, 4493 rows):
+all 4493 `(engine_id, cycle)` rows arrived, with 0 DLQ records, for a plain run at
+`--speed 50`, for `docker compose stop` + `start` of the bridge mid-replay, and for
+`docker compose restart kafka` mid-replay. Both outages ended with 0 duplicates, because
+the bridge shut down gracefully and the idempotent producer retried in order.
+
+A crash is different from a graceful stop. If the bridge is SIGKILLed (no flush, no final
+acks), it can produce duplicates, but nothing is lost. `scripts/verify-stack.sh --crash`
+replays units 81-100 at `--speed 20`, runs `docker kill` on the bridge after 10 s, leaves it
+down for 15 s and then starts it again. In testing every run delivered all 4493 rows, with
+0 missing and 0 DLQ, and 10-15 duplicates per run (one run had 0). The Flink stage (not
+built yet) is responsible for deduplicating on `(engine_id, cycle)`.
+
+`docker kill` counts as a manual stop, so `restart: unless-stopped` does **not** bring the
+container back, and the test starts it again with `docker compose start`. A real crash of
+the process, or an OOM kill at the 256m `mem_limit`, is not a manual stop, so Docker
+restarts the container automatically.
+
+### Running the bridge from the host
+
+Defaults target the compose network. Override them to run with the `.venv`, and stop the
+container first, because both use the same client id and session:
+
+```bash
+docker compose stop mqtt-kafka-bridge
+MQTT_HOST=localhost KAFKA_BOOTSTRAP=localhost:9094 HEARTBEAT_FILE=/tmp/bridge-hb \
+  .venv/bin/python -m bridge.bridge
+```
+
+Env vars: `MQTT_HOST` (`mosquitto`), `MQTT_PORT` (`1883`), `MQTT_TOPIC`
+(`factory/engines/+/telemetry`), `MQTT_CLIENT_ID` (`pdm-mqtt-kafka-bridge`),
+`MQTT_SESSION_EXPIRY` (`86400`), `MQTT_RECEIVE_MAXIMUM` (`1000`), `KAFKA_BOOTSTRAP`
+(`kafka:9092`), `KAFKA_TOPIC_RAW`, `KAFKA_TOPIC_DLQ`, `HEARTBEAT_FILE`
+(`/tmp/bridge-heartbeat`), `STATS_INTERVAL` (`10`), `SHUTDOWN_TIMEOUT` (`30`), `LOG_LEVEL`.
+
+Health: the main loop touches `HEARTBEAT_FILE` every second, and the container healthcheck
+fails if it is older than 30 s. The stats line reports `received`, `produced`, `dlq`,
+`pending` (received but not yet acked), `errors`, `acked`, `stale` (delivered, but received
+on a connection that has since dropped, so not acked; Mosquitto redelivers them), and
+`kafka_queue`.
+
+### Verifying a run against Kafka
+
+`scripts/kafka_check.py` checks only the records written after a snapshot, so earlier
+data doesn't affect the counts. It exits 0 on pass, 1 on fail and 2 if it can't reach Kafka.
+
+```bash
+.venv/bin/python scripts/kafka_check.py --save-snapshot /tmp/snap.json
+.venv/bin/python replayer/replay.py --speed 50
+.venv/bin/python scripts/kafka_check.py --snapshot /tmp/snap.json \
+    --compare-file data/raw/train_FD001.txt --units 81-100 --expect-unique 4493 --expect-dlq 0
+```
+
+It waits until the topic end offsets stop moving, then checks:
+
+* every value against the payload contract (the same `check()` as `e2e_sub.py`)
+* that the key equals `engine_id`
+* that each engine is in one partition
+* per-engine cycle order
+* unique and duplicate counts
+* the exact `(engine_id, cycle)` set against the file
+* the DLQ count
+
+It also prints how engines are spread across the 6 partitions. A redelivered duplicate
+can step back to a cycle that was already seen. That is reported as `raw_regressions` and
+is not a failure. A *new* cycle arriving out of order is a failure.
+
+### Inspecting the DLQ
+
+```bash
+# Kafka UI: Topics -> sensor.telemetry.dlq -> Messages (headers show error_reason)
+# or the console consumer, with headers:
+docker exec -e KAFKA_HEAP_OPTS=-Xmx96m pdm-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:9092 --topic sensor.telemetry.dlq --from-beginning \
+  --formatter-property print.headers=true --formatter-property print.key=true \
+  --timeout-ms 5000 2>/dev/null   # it exits via a (harmless) TimeoutException after 5 s idle
+# bridge log lines for each DLQ'd message:
+docker compose logs mqtt-kafka-bridge | grep DLQ
+```
+
+Fix the producer and republish. The DLQ keeps the original bytes for 30 days.
